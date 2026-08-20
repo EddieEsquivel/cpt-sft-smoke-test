@@ -1,0 +1,43 @@
+# Secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs and checkpoints
+logs/
+*.log
+*_logs/
+cpt_logs/
+sft_logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cookbook clone (if cloned into project)
+cookbook/
+
+# Jupyter
+.ipynb_checkpoints/
