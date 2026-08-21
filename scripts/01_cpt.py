@@ -47,12 +47,12 @@ logger = logging.getLogger(__name__)
 # ── Defaults ────────────────────────────────────────────────────────────────
 
 DEFAULTS = {
-    "base_model": "accounts/fireworks/models/qwen3-8b",
-    "tokenizer_model": "Qwen/Qwen3-8B",
-    "training_shape_id": "accounts/fireworks/trainingShapes/qwen3-8b-128k",
+    "base_model": "accounts/fireworks/models/qwen3p8-27b",
+    "tokenizer_model": "Qwen/Qwen3.8-27B",
+    "training_shape_id": "accounts/fireworks/trainingShapes/qwen3p8-27b-262k-b300",
     "dataset": "data/cpt_domain_corpus.jsonl",
     "log_path": "./logs/cpt",
-    "output_model_id": "accounts/fireworks/models/qwen3-8b-cpt-domain",
+    "output_model_id": "accounts/fireworks/models/qwen3p8-27b-cpt-domain",
     "max_seq_len": 4096,
     "batch_size": 4,
     "learning_rate": 1e-5,

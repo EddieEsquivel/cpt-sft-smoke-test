@@ -9,7 +9,7 @@ This project is designed for learning and sharing with customers. It includes sa
 ## What this project demonstrates
 
 ```
-Base Model (Qwen3-8B)
+Base Model (Qwen3.8-27B)
       │
       ▼
 ┌──────────────────┐
@@ -230,9 +230,9 @@ git status  # should NOT show .env
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `base_model` | `accounts/fireworks/models/qwen3-8b` | Check [Models](https://docs.fireworks.ai/fine-tuning/models) for alternatives |
-| `training_shape_id` | `accounts/fireworks/trainingShapes/qwen3-8b-128k` | Full-param, 4×B200, 128K context |
-| `tokenizer_model` | `Qwen/Qwen3-8B` | HuggingFace tokenizer name |
+| `base_model` | `accounts/fireworks/models/qwen3p8-27b` | Check [Models](https://docs.fireworks.ai/fine-tuning/models) for alternatives |
+| `training_shape_id` | `accounts/fireworks/trainingShapes/qwen3p8-27b-262k-b300` | Full-param, 4×B300, 262K context |
+| `tokenizer_model` | `Qwen/Qwen3.8-27B` | HuggingFace tokenizer name |
 
 ### Hyperparameters
 
@@ -248,9 +248,9 @@ git status  # should NOT show .env
 
 Check [Models](https://docs.fireworks.ai/fine-tuning/models) for the live per-model matrix. Look for models with a dedicated full-parameter training shape. Example alternatives:
 
-- `accounts/fireworks/models/qwen3-32b` — larger, more capable
+- `accounts/fireworks/models/qwen3p8-27b` — Qwen 3.8 27B (used in this project)
+- `accounts/fireworks/models/qwen3-32b` — larger Qwen 3 model
 - `accounts/fireworks/models/deepseek-v3` — different model family
-- `accounts/fireworks/models/llama4-scout-17b-16e-instruct` — Meta's latest
 
 ---
 

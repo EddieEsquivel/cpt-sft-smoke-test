@@ -13,7 +13,7 @@ Prerequisites:
 Usage:
   python scripts/03_evaluate.py
   python scripts/03_evaluate.py --ft-model accounts/fireworks/models/my-model
-  python scripts/03_evaluate.py --base-model accounts/fireworks/models/qwen3-8b
+  python scripts/03_evaluate.py --base-model accounts/fireworks/models/qwen3p8-27b
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULTS = {
-    "base_model": "accounts/fireworks/models/qwen3-8b",
-    "ft_model": "accounts/fireworks/models/qwen3-8b-cpt-sft-domain",
+    "base_model": "accounts/fireworks/models/qwen3p8-27b",
+    "ft_model": "accounts/fireworks/models/qwen3p8-27b-cpt-sft-domain",
     "base_url": "https://api.fireworks.ai/inference/v1",
 }
 

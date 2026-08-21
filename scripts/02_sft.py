@@ -40,12 +40,12 @@ logger = logging.getLogger(__name__)
 # ── Defaults ────────────────────────────────────────────────────────────────
 
 DEFAULTS = {
-    "cpt_model_id": "accounts/fireworks/models/qwen3-8b-cpt-domain",
-    "output_model_id": "accounts/fireworks/models/qwen3-8b-cpt-sft-domain",
-    "tokenizer_model": "Qwen/Qwen3-8B",
+    "cpt_model_id": "accounts/fireworks/models/qwen3p8-27b-cpt-domain",
+    "output_model_id": "accounts/fireworks/models/qwen3p8-27b-cpt-sft-domain",
+    "tokenizer_model": "Qwen/Qwen3.8-27B",
     "dataset": "data/sft_domain_examples.jsonl",
     "log_path": "./logs/sft",
-    "training_shape_id": "accounts/fireworks/trainingShapes/qwen3-8b-128k",
+    "training_shape_id": "accounts/fireworks/trainingShapes/qwen3p8-27b-262k-b300",
     "learning_rate": 1e-5,
     "epochs": 3,
     "batch_size": 2,
@@ -99,7 +99,7 @@ def main():
     training_shape = args.training_shape
     if args.lora_rank > 0:
         # Switch to LoRA shape if available — check docs.fireworks.ai/fine-tuning/models
-        lora_shape = args.training_shape.replace("-128k", "-256k-h200-lora")
+        lora_shape = args.training_shape.replace("-b300", "-b300-lora")
         logger.info("Using LoRA shape: %s", lora_shape)
         training_shape = lora_shape
 
