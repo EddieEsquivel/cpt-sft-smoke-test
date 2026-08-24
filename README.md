@@ -61,6 +61,8 @@ cpt-sft-smoke-test/
 │   ├── 01_cpt.py             # Stage 1: CPT training loop
 │   ├── 02_sft.py             # Stage 2: SFT (chained on CPT checkpoint)
 │   └── 03_evaluate.py        # Stage 3: Compare base vs fine-tuned model
+├── tests/
+│   └── test_cpt_helpers.py    # CPU-only checks for CPT step planning and loss semantics
 └── logs/                     # Training logs and checkpoints (gitignored)
 ```
 
@@ -141,42 +143,86 @@ post-trained checkpoint -> small CPT pilot -> full CPT -> recovery SFT -> domain
 If a compatible base checkpoint is available, starting CPT from it is usually more forgiving. When
 only a post-trained checkpoint is available, use the recommendations below.
 
-### Recommended starting hyperparameters
+### SDK-connected starting hyperparameters
 
 These are starting points for **full-parameter CPT** on approximately 10B-20B training tokens. Tune
-them with a smaller pilot before committing to the full run.
+them with a smaller pilot before committing to the full run. Every row below names the exact
+`01_cpt.py` CLI control and the Fireworks/Tinker SDK field or call it reaches.
 
-| Hyperparameter | Recommended starting point | Practical range / notes |
-|---|---:|---|
-| Peak learning rate | `2e-6` | Start in `1e-6`-`3e-6`. Use the low end for narrow or repetitive data, or when no general replay data is available. |
-| Warmup | 500 optimizer steps | Use `min(500 steps, 10% of total steps)` for short runs. Increase LR linearly from 0 to the peak. |
-| LR schedule | Cosine decay | Decay from the peak to `0` (or to about 10% of peak if a non-zero floor is preferred). Do not hold the peak LR for the whole run. |
-| Optimizer | AdamW | `beta1=0.9`, `beta2=0.95`, `eps=1e-8`, `weight_decay=0.1`. Exclude normalization and bias parameters from weight decay when supported. |
-| Global batch size | 4M loss-bearing tokens per optimizer step | Treat `2M`-`8M` tokens as a tuning range. Use gradient accumulation to reach the global target; this is the sum across all GPUs and microbatches, not examples per GPU. |
-| Sequence length | Match original pre-training when practical | Prefer the checkpoint's native training length. Packing shorter documents is usually more efficient than padding; preserve document boundaries with EOS/separator tokens. |
-| Training budget | 0.5-1.0 pass over the mixture | Budget and report runs in **tokens**, not just epochs. Avoid exceeding 1.0 pass until evals show that more training helps. |
-| Gradient clipping | `1.0` global norm | Track how often clipping occurs; frequent clipping can indicate an unstable LR or bad batches. |
-| Precision | BF16 when supported | Keep optimizer states in the trainer's supported high-precision format. |
-| Checkpoint/eval cadence | Every 100-500 steps | Use a cadence short enough to stop before a broad-capability regression becomes expensive. |
+| Training intent | Starting value | `01_cpt.py` control | Exact SDK mapping |
+|---|---:|---|---|
+| Peak learning rate | `2e-6` | `--lr 2e-6` | `compute_lr(..., base_lr=args.lr)` produces the current step LR, which is passed as `tinker.AdamParams(learning_rate=step_lr)` to `optim_step`. The same peak is supplied to `FiretitanServiceClient.from_firetitan_config` as provisioning metadata/default. |
+| Warmup | `min(500, 10% of total optimizer steps)` | `--warmup-steps N` | `CosineSchedule(warmup_steps=N, ...)`, evaluated client-side by `compute_lr` before every optimizer step. |
+| LR schedule | Cosine | `--lr-schedule cosine` | Constructs `CosineSchedule`; the smoke-test default remains `ConstantSchedule`. Both are evaluated client-side by `compute_lr`. |
+| LR decay floor | `0` | `--min-lr-ratio 0` | `CosineSchedule(min_lr_ratio=0)`. Set `0.1` to finish at 10% of the peak LR. |
+| AdamW beta1 | `0.9` | `--adam-beta1 0.9` | `tinker.AdamParams(beta1=0.9)` |
+| AdamW beta2 | `0.95` | `--adam-beta2 0.95` | `tinker.AdamParams(beta2=0.95)` |
+| AdamW epsilon | `1e-8` | `--adam-eps 1e-8` | `tinker.AdamParams(eps=1e-8)` |
+| AdamW weight decay | `0.1` | `--weight-decay 0.1` | `tinker.AdamParams(weight_decay=0.1)`. This is one scalar applied to the trainer's optimizer parameter groups; the current SDK does not expose separate bias/norm exclusions. |
+| Effective token batch | 4M loss tokens per optimizer step | `--target-tokens-per-step 4000000` | Client control flow issues multiple `forward_backward_custom` calls, then one `optim_step`. There is no GBS field in the SDK. |
+| Forward/backward request size | Largest safe document count for the selected shape | `--batch-size N` | Length of the datum list passed to each `forward_backward_custom` call. It controls request/microbatch granularity, not effective GBS. |
+| Gradient clipping | `1.0` global norm | `--grad-clip-norm 1.0` | `tinker.AdamParams(grad_clip_norm=1.0)`; `0` disables clipping. |
+| Sequence length | Match original pre-training when practical | `--max-seq-len N` | Passed to `datum_from_model_input_weights(..., max_length=N)` during client-side tokenization. It must not exceed the training shape's resolved maximum context length. |
+| Training budget | 0.5-1.0 pass over the mixture | `--epochs N` plus the dataset size | The SDK has no epoch field; the client loop decides how many datums/tokens to submit. |
+| Checkpoint cadence | Every 100-500 optimizer steps | `--save-every N` | Calls `training_client.save_state(...)` after every Nth `optim_step`. |
 
-The current `01_cpt.py` accepts batches as a **number of documents**, so `--batch-size 4` does not
-mean 4M tokens. For a real run, the data loader/training loop must pack examples and accumulate
-microbatches until the target number of loss-bearing tokens has contributed to an optimizer step.
-If the per-device microbatch contains `microbatch_tokens`, then approximately:
+The trainer executes AdamW. The five optimizer values above map one-for-one to fields on the
+`tinker.AdamParams` object sent with **each** optimizer step; they are not hidden trainer-job
+defaults. The LR is the only value that changes from step to step.
 
-```text
-global_batch_tokens = microbatch_tokens * data_parallel_workers * gradient_accumulation_steps
-optimizer_steps = total_training_tokens / global_batch_tokens
+### How token GBS maps to the SDK
+
+There is deliberately no `global_batch_size`, data-parallel-worker multiplier, or trainer-job
+`gradient_accumulation_steps` setting in this path. The client submits the global datum stream and
+the selected training shape owns device parallelism. Each `forward_backward_custom(...)` call
+accumulates gradients on the server; `optim_step(...)` applies and clears them.
+
+`01_cpt.py` therefore counts the actual non-zero loss weights returned as `n_tokens`, repeats
+forward/backward calls until `--target-tokens-per-step` is reached, and then performs exactly one
+optimizer step. The last forward/backward call can make the actual step slightly larger than the
+target, and the script logs the realized loss-token count.
+
+The CPT loss returns a **raw token sum**, so the matching SDK normalization is required:
+
+```python
+training_client.optim_step(
+    adam_params,
+    grad_accumulation_normalization=GradAccNormalization.NUM_LOSS_TOKENS,
+)
 ```
+
+FireTitan then divides the accumulated gradients by the total loss-token count before clipping and
+AdamW. Returning a per-call mean and also using `NUM_LOSS_TOKENS` would double-normalize; returning a
+per-call mean without server normalization would weight short and long microbatches incorrectly.
 
 For example, 10B tokens with a 4M-token global batch is about 2,500 optimizer steps; 20B tokens is
 about 5,000 steps. A 500-step warmup therefore corresponds to 20% and 10% respectively. For the
 10B-token case, prefer the `10% of total steps` cap (250 warmup steps).
 
-> **Implementation note:** the sample script currently uses a constant learning rate, document-count
-> batches, and AdamW weight decay `0.01`. Warmup, cosine scheduling, token-budgeted batching/gradient
-> accumulation, and the `0.1` production weight decay above require extending the training loop or
-> using a trainer recipe that exposes those controls. Do not assume the sample CLI implements them.
+A concrete 10B-token starting command is:
+
+```bash
+python scripts/01_cpt.py \
+  --lr 2e-6 \
+  --lr-schedule cosine \
+  --warmup-steps 250 \
+  --min-lr-ratio 0 \
+  --adam-beta1 0.9 \
+  --adam-beta2 0.95 \
+  --adam-eps 1e-8 \
+  --weight-decay 0.1 \
+  --grad-clip-norm 1.0 \
+  --target-tokens-per-step 4000000 \
+  --batch-size 8 \
+  --epochs 1 \
+  --save-every 100
+```
+
+Choose `--batch-size` as the largest documents-per-request value that fits the selected shape; it
+does not change the effective token batch target. For 20B tokens at the same target, use 500 warmup
+steps as the initial setting. Run `--dry-run` first to see the exact loss-token and optimizer-step
+plan. The sample loader still materializes the corpus in memory, so a 10B-20B-token production data
+pipeline should stream/shard datums while preserving the same SDK step and normalization mapping.
 
 ### Data mixture recommendations
 
@@ -252,6 +298,9 @@ without erasing the domain gains.
 - Loads raw text documents from `data/cpt_domain_corpus.jsonl`
 - Tokenizes each document with all token weights set to `1.0`
 - Uses `forward_backward_custom` with a cross-entropy loss over all tokens
+- Accumulates forward/backward calls to a target number of loss tokens per optimizer step
+- Applies client-side warmup/cosine LR and maps every AdamW value to `tinker.AdamParams`
+- Uses `NUM_LOSS_TOKENS` server normalization so variable-length microbatches form one token mean
 - Trains full-parameter (not LoRA) on dedicated Fireworks GPUs
 - Saves and promotes the checkpoint as a new Fireworks model
 
@@ -266,11 +315,12 @@ Validates tokenization and prints stats without provisioning any GPUs.
 
 **Smoke-test customization:**
 ```bash
-python scripts/01_cpt.py --epochs 1 --lr 2e-6 --batch-size 8
+python scripts/01_cpt.py --epochs 1 --lr 2e-6 --lr-schedule constant --batch-size 8
 ```
 
-This CLI still batches by document and does not implement the production warmup/schedule described
-above. Use it to validate the API path, not as the complete real-CPT recipe.
+The CLI implements the same SDK mapping as the real recipe. Leaving
+`--target-tokens-per-step 0` means one forward/backward request per optimizer step, which is useful
+for the tiny smoke-test corpus but is not the recommended real-CPT effective batch.
 
 ### Stage 2: SFT (`02_sft.py`)
 
@@ -365,9 +415,15 @@ CPT settings; use the production starting points above for a post-trained checkp
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `learning_rate` | `1e-5` | Smoke-test default; real post-trained-checkpoint CPT should generally start around `2e-6` |
+| `learning_rate` | `1e-5` | `--lr`; smoke-test default. Real post-trained-checkpoint CPT should generally start around `2e-6` |
+| `lr_schedule` | `constant` | `--lr-schedule`; use `cosine` for the real-CPT recipe |
+| `warmup_steps` | 0 | `--warmup-steps`; mapped through the selected SDK schedule and `compute_lr` |
+| `min_lr_ratio` | 0 | `--min-lr-ratio`; cosine-decay floor relative to peak LR |
+| AdamW | `beta1=0.9`, `beta2=0.95`, `eps=1e-8`, `weight_decay=0.01` | Each value maps directly to `tinker.AdamParams`; use `weight_decay=0.1` for the real-CPT starting recipe |
+| `grad_clip_norm` | 0 | `--grad-clip-norm`; 0 disables clipping, real-CPT starting value is 1.0 |
 | `epochs` | 2 (CPT), 3 (SFT) | Smoke-test default; budget real CPT by tokens and start with 0.5-1.0 data passes |
-| `batch_size` | 4 (CPT), 2 (SFT) | Number of documents/examples in these scripts, **not tokens** |
+| `batch_size` | 4 (CPT), 2 (SFT) | CPT: documents per `forward_backward_custom` call, not GBS. SFT: examples per optimizer step |
+| `target_tokens_per_step` | 0 | CPT-only; 0 means one F/B call per optimizer step. Use 4M as the real-CPT starting target |
 | `max_seq_len` | 4096 | Truncate longer sequences |
 | `lora_rank` | 0 (CPT), 0 (SFT) | 0 = full-parameter; use 32+ for LoRA SFT |
 
