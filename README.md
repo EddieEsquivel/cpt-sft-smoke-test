@@ -9,7 +9,7 @@ This project is designed for learning and sharing with customers. It includes sa
 ## What this project demonstrates
 
 ```
-Base Model (Qwen3.8-27B)
+Post-trained Checkpoint (Qwen3.8-27B Instruct/Chat)
       │
       ▼
 ┌──────────────────┐
@@ -123,6 +123,127 @@ python scripts/03_evaluate.py
 
 ---
 
+## Real CPT on a post-trained checkpoint
+
+The included data and defaults are intentionally small so that this repository can validate the
+pipeline quickly. They are **not** a production CPT recipe. In the real use case, CPT starts from a
+post-trained (instruct/chat) checkpoint rather than a base pre-training checkpoint. This is
+possible, but it requires a more conservative recipe because an instruct model can lose chat
+formatting, instruction following, safety behavior, or broad knowledge while adapting to the new
+domain.
+
+A good end-to-end plan is:
+
+```text
+post-trained checkpoint -> small CPT pilot -> full CPT -> recovery SFT -> domain + general evals
+```
+
+If a compatible base checkpoint is available, starting CPT from it is usually more forgiving. When
+only a post-trained checkpoint is available, use the recommendations below.
+
+### Recommended starting hyperparameters
+
+These are starting points for **full-parameter CPT** on approximately 10B-20B training tokens. Tune
+them with a smaller pilot before committing to the full run.
+
+| Hyperparameter | Recommended starting point | Practical range / notes |
+|---|---:|---|
+| Peak learning rate | `2e-6` | Start in `1e-6`-`3e-6`. Use the low end for narrow or repetitive data, or when no general replay data is available. |
+| Warmup | 500 optimizer steps | Use `min(500 steps, 10% of total steps)` for short runs. Increase LR linearly from 0 to the peak. |
+| LR schedule | Cosine decay | Decay from the peak to `0` (or to about 10% of peak if a non-zero floor is preferred). Do not hold the peak LR for the whole run. |
+| Optimizer | AdamW | `beta1=0.9`, `beta2=0.95`, `eps=1e-8`, `weight_decay=0.1`. Exclude normalization and bias parameters from weight decay when supported. |
+| Global batch size | 4M loss-bearing tokens per optimizer step | Treat `2M`-`8M` tokens as a tuning range. Use gradient accumulation to reach the global target; this is the sum across all GPUs and microbatches, not examples per GPU. |
+| Sequence length | Match original pre-training when practical | Prefer the checkpoint's native training length. Packing shorter documents is usually more efficient than padding; preserve document boundaries with EOS/separator tokens. |
+| Training budget | 0.5-1.0 pass over the mixture | Budget and report runs in **tokens**, not just epochs. Avoid exceeding 1.0 pass until evals show that more training helps. |
+| Gradient clipping | `1.0` global norm | Track how often clipping occurs; frequent clipping can indicate an unstable LR or bad batches. |
+| Precision | BF16 when supported | Keep optimizer states in the trainer's supported high-precision format. |
+| Checkpoint/eval cadence | Every 100-500 steps | Use a cadence short enough to stop before a broad-capability regression becomes expensive. |
+
+The current `01_cpt.py` accepts batches as a **number of documents**, so `--batch-size 4` does not
+mean 4M tokens. For a real run, the data loader/training loop must pack examples and accumulate
+microbatches until the target number of loss-bearing tokens has contributed to an optimizer step.
+If the per-device microbatch contains `microbatch_tokens`, then approximately:
+
+```text
+global_batch_tokens = microbatch_tokens * data_parallel_workers * gradient_accumulation_steps
+optimizer_steps = total_training_tokens / global_batch_tokens
+```
+
+For example, 10B tokens with a 4M-token global batch is about 2,500 optimizer steps; 20B tokens is
+about 5,000 steps. A 500-step warmup therefore corresponds to 20% and 10% respectively. For the
+10B-token case, prefer the `10% of total steps` cap (250 warmup steps).
+
+> **Implementation note:** the sample script currently uses a constant learning rate, document-count
+> batches, and AdamW weight decay `0.01`. Warmup, cosine scheduling, token-budgeted batching/gradient
+> accumulation, and the `0.1` production weight decay above require extending the training loop or
+> using a trainer recipe that exposes those controls. Do not assume the sample CLI implements them.
+
+### Data mixture recommendations
+
+Measure mixture percentages by **tokens after tokenization**, not by files or documents. A strong
+initial mixture for CPT from a post-trained checkpoint is:
+
+| Data source | Initial share | Purpose |
+|---|---:|---|
+| High-quality domain text | 70%-80% | Learn the target vocabulary, facts, style, and reasoning patterns. |
+| General pre-training replay | 15%-25% | Reduce catastrophic forgetting of broad language and world knowledge. |
+| High-quality instruction/chat replay | 5%-10% | Help preserve instruction following and the checkpoint's chat behavior. |
+
+`75% domain / 20% general / 5% instruction` is a reasonable first pilot. Suitable general replay
+can come from licensed, quality-filtered subsets of sources such as FineWeb/RefinedWeb, C4,
+RedPajama, Wikipedia, books, news, or code, chosen to resemble the original checkpoint's language
+and capability mix. The exact source matters less than quality, diversity, license compatibility,
+and the absence of evaluation contamination.
+
+If general pre-training text is unavailable, try `80%-90%` domain text plus `10%-20%` diverse,
+high-quality instruction data, lower the peak LR toward `1e-6`, and limit the initial run to
+0.3-0.5 passes. This is a higher-risk fallback, not an equivalent substitute for general replay.
+A recovery SFT is especially important in this case.
+
+Instruction data should retain the checkpoint's expected chat template and ideally use an
+assistant-only SFT loss. The sample CPT loop assigns loss to every token, so do not simply append
+chat JSON to the raw-text corpus and assume it provides the same preservation effect. Either use an
+interleaved objective that preserves the SFT loss mask or reserve instruction examples for the
+post-CPT recovery SFT.
+
+### Data quality checklist
+
+- Prefer complete, authoritative documents over scraped fragments. Remove navigation, boilerplate,
+  corrupted text, generated spam, and low-information repetition.
+- Apply exact and near-duplicate removal before sampling. Split train/validation/eval data by source
+  or document before chunking so near-identical passages cannot leak across splits.
+- Verify licenses, access controls, privacy/PII handling, and retention requirements. Remove secrets
+  and content the final model should not reproduce.
+- Match the target languages, code/text balance, and document types intentionally. Do not obtain a
+  target token count by repeatedly duplicating a small corpus.
+- Tokenize with the checkpoint's tokenizer. Pack short documents efficiently, insert explicit
+  boundaries, and avoid silently truncating the most informative portion of long documents.
+- Decontaminate against every domain and general evaluation set. Keep a held-out domain validation
+  set that is never used for training or mixture tuning.
+- Inspect random samples and per-source token counts after the full preprocessing pipeline. Quality
+  and diversity are usually more valuable than adding another pass over noisy data.
+
+### Pilot, monitoring, and stopping criteria
+
+Before a 10B-20B-token run, train a roughly 100M-1B-token pilot and compare several checkpoints. At
+minimum, evaluate:
+
+- held-out domain loss/perplexity and task accuracy;
+- held-out general-text loss plus broad capability benchmarks relevant to the original checkpoint;
+- instruction following, chat-template correctness, safety/refusal behavior, and response style;
+- train loss, validation loss, gradient norm, clipping frequency, and tokens processed per source.
+
+Record the starting checkpoint's scores before CPT and set an acceptable regression budget in
+advance (for example, no more than a 2%-3% relative drop on critical general/instruction evals).
+Stop early when domain validation stops improving, general loss rises persistently, instruction
+behavior crosses that budget, or optimization becomes unstable. Select the checkpoint by the
+combined evaluation suite rather than automatically taking the final step.
+
+After CPT, run a lightweight recovery SFT on approximately 5K-20K high-quality, diverse examples
+using the original chat template. A peak LR around `5e-6` (often in the `3e-6`-`1e-5` range) for
+1-2 epochs is a reasonable starting point, but validate that it restores instruction behavior
+without erasing the domain gains.
+
 ## Detailed walkthrough
 
 ### Stage 1: Continuous Pre-Training (`01_cpt.py`)
@@ -143,10 +264,13 @@ python scripts/01_cpt.py --dry-run
 ```
 Validates tokenization and prints stats without provisioning any GPUs.
 
-**Customization:**
+**Smoke-test customization:**
 ```bash
-python scripts/01_cpt.py --epochs 3 --lr 2e-5 --batch-size 8
+python scripts/01_cpt.py --epochs 1 --lr 2e-6 --batch-size 8
 ```
+
+This CLI still batches by document and does not implement the production warmup/schedule described
+above. Use it to validate the API path, not as the complete real-CPT recipe.
 
 ### Stage 2: SFT (`02_sft.py`)
 
@@ -171,12 +295,12 @@ python scripts/02_sft.py --max-examples 100 --epochs 5
 ### Stage 3: Evaluation (`03_evaluate.py`)
 
 **What it does:**
-- Sends domain-specific questions to both the base model and the fine-tuned model
+- Sends domain-specific questions to both the starting post-trained checkpoint and the fine-tuned model
 - Scores responses by checking for expected keywords from the training data
 - Prints a side-by-side comparison and a summary score
 
 **Expected result:**
-The base model won't know your internal company data (revenue numbers, policies, etc.). The fine-tuned model should answer accurately because it learned this information during CPT and learned to respond in structured format during SFT.
+The starting checkpoint won't know your internal company data (revenue numbers, policies, etc.). The fine-tuned model should answer accurately because it learned this information during CPT and learned to respond in structured format during SFT.
 
 ---
 
@@ -234,13 +358,16 @@ git status  # should NOT show .env
 | `training_shape_id` | `accounts/fireworks/trainingShapes/qwen3p8-27b-262k-b300` | Full-param, 4×B300, 262K context |
 | `tokenizer_model` | `Qwen/Qwen3.8-27B` | HuggingFace tokenizer name |
 
-### Hyperparameters
+### Smoke-test hyperparameters implemented by the sample scripts
+
+These defaults are chosen for the tiny demonstration datasets. They are not the recommended real
+CPT settings; use the production starting points above for a post-trained checkpoint.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `learning_rate` | `1e-5` | Low LR for CPT to avoid catastrophic forgetting |
-| `epochs` | 2 (CPT), 3 (SFT) | More epochs = more learning, but risk of overfitting |
-| `batch_size` | 4 (CPT), 2 (SFT) | Adjust based on GPU memory and dataset size |
+| `learning_rate` | `1e-5` | Smoke-test default; real post-trained-checkpoint CPT should generally start around `2e-6` |
+| `epochs` | 2 (CPT), 3 (SFT) | Smoke-test default; budget real CPT by tokens and start with 0.5-1.0 data passes |
+| `batch_size` | 4 (CPT), 2 (SFT) | Number of documents/examples in these scripts, **not tokens** |
 | `max_seq_len` | 4096 | Truncate longer sequences |
 | `lora_rank` | 0 (CPT), 0 (SFT) | 0 = full-parameter; use 32+ for LoRA SFT |
 
