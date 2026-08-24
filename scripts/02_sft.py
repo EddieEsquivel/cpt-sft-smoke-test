@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 # ── Defaults ────────────────────────────────────────────────────────────────
 
 DEFAULTS = {
-    "cpt_model_id": "accounts/fireworks/models/qwen3p8-27b-cpt-domain",
-    "output_model_id": "accounts/fireworks/models/qwen3p8-27b-cpt-sft-domain",
+    "cpt_model_id": "accounts/pyroworks/models/qwen3p8-27b-cpt-domain",
+    "output_model_id": "qwen3p8-27b-cpt-sft-domain",
     "tokenizer_model": "Qwen/Qwen3.8-27B",
     "dataset": "data/sft_domain_examples.jsonl",
     "log_path": "./logs/sft",

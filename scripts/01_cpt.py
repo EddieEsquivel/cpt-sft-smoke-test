@@ -52,7 +52,7 @@ DEFAULTS = {
     "training_shape_id": "accounts/fireworks/trainingShapes/qwen3p8-27b-262k-b300",
     "dataset": "data/cpt_domain_corpus.jsonl",
     "log_path": "./logs/cpt",
-    "output_model_id": "accounts/fireworks/models/qwen3p8-27b-cpt-domain",
+    "output_model_id": "qwen3p8-27b-cpt-domain",
     "max_seq_len": 4096,
     "batch_size": 4,
     "learning_rate": 1e-5,
@@ -93,22 +93,26 @@ def tokenize_for_cpt(text: str, tokenizer, max_seq_len: int):
     This is the standard language modeling objective, the same one used during
     the model's original pre-training, just continued on new domain data.
     """
+    import torch
     import tinker
+    from training.utils.supervised import datum_from_model_input_weights
 
     token_ids = tokenizer.encode(text, add_special_tokens=True)
 
     if len(token_ids) < 2:
         return None
-    if len(token_ids) > max_seq_len:
-        token_ids = token_ids[:max_seq_len]
-        logger.debug("Truncated sequence to %d tokens", max_seq_len)
 
     # CPT core: all weights = 1 (learn from every token)
     token_weights = [1.0] * len(token_ids)
+    weight_tensor = torch.tensor(token_weights, dtype=torch.float32)
 
-    datum = tinker.datum_from_model_input_weights(
-        tokens=token_ids,
-        token_weights=token_weights,
+    model_input = tinker.ModelInput.from_ints(token_ids)
+
+    datum = datum_from_model_input_weights(
+        model_input,
+        weight_tensor,
+        max_length=max_seq_len,
+        reduction="none",
     )
     return datum
 
@@ -207,7 +211,7 @@ def main():
         datum = tokenize_for_cpt(text, tokenizer, args.max_seq_len)
         if datum is not None:
             datums.append(datum)
-            total_tokens += len(datum.model_input.chunks[0].tokens)
+            total_tokens += sum(chunk.length for chunk in datum.model_input.chunks)
     logger.info("Prepared %d datums | total tokens: %d | avg tokens/doc: %d",
                 len(datums), total_tokens, total_tokens // max(len(datums), 1))
 
@@ -310,12 +314,31 @@ def main():
         # 6. Promote to a Fireworks model
         if args.output_model_id:
             logger.info("Promoting to model: %s", args.output_model_id)
-            service.promote_checkpoint(
-                checkpoint_name=f"step-{step}",
-                model_id=args.output_model_id,
-                base_model=args.base_model,
-            )
-            logger.info("Model promoted: %s", args.output_model_id)
+            # List checkpoints to get the full resource name for promotion
+            checkpoints = training_client.list_checkpoints()
+            # Find the promotable checkpoint (INFERENCE_BASE type)
+            cp_name = None
+            for cp in checkpoints:
+                if "promotable" not in cp.lower() or "true" in cp.lower():
+                    cp_name = cp
+            if not cp_name and checkpoints:
+                cp_name = checkpoints[-1]
+            if cp_name:
+                logger.info("Using checkpoint: %s", cp_name)
+                # output_model_id should be just the model name (e.g. "my-model"),
+                # not the full path. The SDK prepends accounts/<acct>/models/.
+                # Extract just the model name if a full path was passed.
+                model_name = args.output_model_id
+                if "/" in model_name:
+                    model_name = model_name.rsplit("/", 1)[-1]
+                service.promote_checkpoint(
+                    name=cp_name,
+                    output_model_id=model_name,
+                    base_model=args.base_model,
+                )
+                logger.info("Model promoted: %s", args.output_model_id)
+            else:
+                logger.error("No checkpoints found to promote")
 
     except KeyboardInterrupt:
         logger.warning("Interrupted — saving emergency checkpoint")

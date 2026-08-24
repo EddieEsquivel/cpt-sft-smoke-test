@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS = {
     "base_model": "accounts/fireworks/models/qwen3p8-27b",
-    "ft_model": "accounts/fireworks/models/qwen3p8-27b-cpt-sft-domain",
+    "ft_model": "accounts/pyroworks/deployments/ycth969f",
     "base_url": "https://api.fireworks.ai/inference/v1",
 }
 
@@ -72,10 +72,24 @@ def query_model(
     question: str,
     api_key: str,
     base_url: str,
-    max_tokens: int = 200,
+    max_tokens: int = 300,
 ) -> str:
-    """Send a chat completion request to a Fireworks model."""
+    """Send a chat completion request to a Fireworks model.
+
+    For Qwen3.8 models, thinking mode is disabled so the response
+    appears in the content field directly.
+    """
     import requests
+
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": question}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        # Qwen3.8 has thinking enabled by default which puts output
+        # in reasoning_content instead of content. Disable it.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
 
     response = requests.post(
         f"{base_url}/chat/completions",
@@ -83,13 +97,8 @@ def query_model(
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": model_id,
-            "messages": [{"role": "user", "content": question}],
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-        },
-        timeout=60,
+        json=payload,
+        timeout=120,
     )
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
