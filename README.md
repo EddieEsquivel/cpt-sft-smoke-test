@@ -226,31 +226,122 @@ pipeline should stream/shard datums while preserving the same SDK step and norma
 
 ### Data mixture recommendations
 
-Measure mixture percentages by **tokens after tokenization**, not by files or documents. A strong
-initial mixture for CPT from a post-trained checkpoint is:
+Choose the data path from the artifacts released for the **exact starting checkpoint**. “Open
+weights” does not imply that the pre-training, mid-training, reasoning, tool-use, or RL data is
+available. Likewise, a model family may publish many datasets without publishing every artifact
+used for a particular checkpoint.
 
-| Data source | Initial share | Purpose |
+| Starting-checkpoint disclosure | Recommended path |
+|---|---|
+| Original mixture and data are available | Reuse the model-specific mixture as the preservation slice, pinned to the published dataset revisions and preprocessing recipe. |
+| Some model-family data and recipes are available | Reuse the released components; record every unavailable component and substitute only those components with a documented proxy. |
+| Weights are open but original data is not | Build a **proxy mid-training bridge** from general raw data, verified reasoning data, agent/tool trajectories, and behavior sampled from the untouched starting checkpoint. Do not call this original-data replay. |
+
+Measure mixture percentages by **loss-bearing tokens after tokenization**, not by files or rows.
+Also report input-token percentages because a role-masked trajectory can contain many context and
+tool-result tokens that do not contribute loss.
+
+#### Path A: original data is not open, such as Qwen3.5
+
+The [Qwen3.5-27B model card](https://huggingface.co/Qwen/Qwen3.5-27B) identifies pre-training and
+post-training, reasoning/non-reasoning operation, tool calling, multimodal training, and
+large-scale agent RL, but it does not publish a training dataset or a reproducible data mixture.
+For that case, treat the following as a conservative pilot mixture, not an estimate of Qwen's
+private mixture:
+
+| Mid-training stream | Initial share of loss tokens | Purpose |
 |---|---:|---|
-| High-quality domain text | 70%-80% | Learn the target vocabulary, facts, style, and reasoning patterns. |
-| General pre-training replay | 15%-25% | Reduce catastrophic forgetting of broad language and world knowledge. |
-| High-quality instruction/chat replay | 5%-10% | Help preserve instruction following and the checkpoint's chat behavior. |
+| High-quality target-domain raw/structured data | 60% | Learn the target knowledge, vocabulary, code, and document patterns. |
+| Licensed general raw anchor | 15% | Preserve broad language, multilingual knowledge, code, and STEM coverage. |
+| Verified reasoning-bearing sequences | 15% | Rehearse long-form math, code, science, and general reasoning before final SFT. |
+| Executable multi-turn agent/tool trajectories | 7% | Rehearse tool selection, arguments, observations, retries, and abstention. |
+| Broad instruction/dialogue bridge | 3% | Preserve the transition from pre-training-style text to the final SFT distribution. |
 
-`75% domain / 20% general / 5% instruction` is a reasonable first pilot. Suitable general replay
-can come from licensed, quality-filtered subsets of sources such as FineWeb/RefinedWeb, C4,
-RedPajama, Wikipedia, books, news, or code, chosen to resemble the original checkpoint's language
-and capability mix. The exact source matters less than quality, diversity, license compatibility,
-and the absence of evaluation contamination.
+Suitable public proxy components include quality-filtered
+[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu), multilingual
+[FineWeb2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2), or
+[Dolma](https://huggingface.co/datasets/allenai/dolma) for the general anchor;
+[OpenThoughts3](https://huggingface.co/datasets/open-thoughts/OpenThoughts3-1.2M) and
+[OpenCodeReasoning](https://huggingface.co/datasets/nvidia/OpenCodeReasoning) for reasoning; and
+[ToolACE](https://huggingface.co/datasets/Team-ACE/ToolACE) or
+[xLAM function calling](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k) for
+generic tool-use seeds. Dataset labels such as “SFT” do not prevent high-quality,
+instruction-formatted sequences from being used in a mixed mid-training bridge. The important
+choices are the sequence format, loss mask, mixture weight, and verification quality.
 
-If general pre-training text is unavailable, try `80%-90%` domain text plus `10%-20%` diverse,
-high-quality instruction data, lower the peak LR toward `1e-6`, and limit the initial run to
-0.3-0.5 passes. This is a higher-risk fallback, not an equivalent substitute for general replay.
-A recovery SFT is especially important in this case.
+Public proxy data will not reproduce Qwen3.5's private reasoning or agent distribution. Add
+model-specific behavior replay by using a frozen copy of the original checkpoint as a teacher,
+subject to its license and usage terms:
 
-Instruction data should retain the checkpoint's expected chat template and ideally use an
-assistant-only SFT loss. The sample CPT loop assigns loss to every token, so do not simply append
-chat JSON to the raw-text corpus and assume it provides the same preservation effect. Either use an
-interleaved objective that preserves the SFT loss mask or reserve instruction examples for the
-post-CPT recovery SFT.
+1. Record a pre-CPT capability baseline for thinking and non-thinking modes, multilingual tasks,
+   long context, coding, tool use, and, when required, vision-language tasks.
+2. Generate paired thinking/non-thinking answers with the checkpoint's native chat template and
+   control settings. Preserve its native special tokens rather than translating the traces to a
+   different model's format.
+3. Generate trajectories against the actual production tool schemas and a sandboxed executor.
+   Include no-tool cases, impossible calls, invalid arguments, tool errors, retries, parallel
+   calls, long tool responses, and multi-turn state.
+4. Keep only answers that pass answer, code, schema, or environment verification. Teacher output
+   without verification is not high-quality replay.
+5. Hold out prompts and tool environments for capability-regression evaluation; do not train on
+   the evaluation set.
+
+For raw documents, use loss weight `1` on every non-padding token. For formatted reasoning and tool
+trajectories, serialize with the Qwen3.5 chat template, mask system/user/tool-observation context,
+and assign weight `1` to assistant reasoning, tool calls, and final answers. This trains the
+capability-bearing sequence during mid-training; the subsequent SFT remains a final alignment and
+domain-instruction stage rather than the sole source of reasoning or agent behavior.
+
+Qwen3.5 is a unified vision-language model. A text-only CPT job cannot replay its visual pathway.
+If visual capability must be retained, use a training path that supports multimodal replay and add
+held-out vision-language evaluations. Otherwise, explicitly label the resulting checkpoint as
+text-specialized and accept that visual capability is outside this smoke test's preservation
+guarantee.
+
+#### Path B: model-specific data and recipes are available, such as Nemotron
+
+For a Nemotron checkpoint, start from the **exact model card and exact recipe**, then follow its
+declared stages and mixtures inside the preservation slice. Useful primary references are the
+[Nemotron developer repository](https://github.com/NVIDIA-NeMo/Nemotron), the
+[Nemotron pre-training collection](https://huggingface.co/collections/nvidia/nemotron-pre-training-datasets),
+and the [Nemotron v3 post-training collection](https://huggingface.co/collections/nvidia/nemotron-post-training-v3).
+These releases include model-family web, code, math, specialized pre-training, reasoning,
+instruction, and agent/tool-use datasets as well as stage-specific preparation and training
+recipes.
+
+Use the released recipe as follows:
+
+1. Pin the precise checkpoint, recipe commit, dataset revisions, tokenizer, chat template, and
+   license terms. Do not substitute a similarly named Nemotron model's blend silently.
+2. Reconstruct the released original-data categories and their published proportions inside the
+   preservation slice; add the target-domain stream as the adaptation slice.
+3. Preserve stage semantics: raw/pre-training data uses all-token causal loss, while formatted
+   reasoning and agent data retains the recipe's packing, role formatting, and loss mask.
+4. Mark each source in the manifest as `released_original`, `proxy_substitute`, or
+   `teacher_generated`, and log its input tokens, loss tokens, revision, and license.
+5. Run the model recipe's published evaluations plus the domain evaluation before choosing the CPT
+   checkpoint.
+
+Nemotron is more transparent, but it is not automatically a bit-for-bit open reproduction. The
+developer repository explicitly notes that several open-source recipes use only the released
+subset and can differ from published results that used proprietary data; some long-context data
+and intermediate teacher checkpoints are also unreleased. Apply Path A only to those documented
+gaps instead of describing the whole preservation mixture as original replay.
+
+#### Mapping the mixed data path to this smoke test
+
+The current `01_cpt.py` loader accepts one raw `text` field and hard-codes all token weights to
+`1`. It can execute the raw domain and general-anchor streams, but it **cannot yet implement** the
+role-masked reasoning and tool streams described above. Do not flatten chat JSON into raw text and
+claim the full recipe is implemented.
+
+A production extension should build one deterministic, token-budgeted datum stream whose entries
+carry token IDs and per-token weights. The existing SDK mechanics then remain unchanged:
+`forward_backward_custom` accumulates the mixed datums, `--target-tokens-per-step` defines the
+effective non-zero loss-token batch, and `optim_step(...,
+grad_accumulation_normalization=NUM_LOSS_TOKENS)` normalizes the combined gradient. The data
+manifest and dry-run output should report realized per-source input and loss tokens for every
+optimizer step.
 
 ### Data quality checklist
 
